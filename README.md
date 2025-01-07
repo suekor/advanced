@@ -89,10 +89,8 @@ Upload a PDF or text file, and it will be chunked, embedded, and stored for futu
 ```plaintext
 src/
 ├── ap2.py                # Streamlit app and main UI logic
-├── chatbot_logic.py      # Core chatbot and ChromaDB integration logic
+
 
 test/
 ├── test_chatbot.py       # Unit tests for chatbot logic
-├── test_chromadb.py      # Unit tests for ChromaDB interactions
-├── test_app.py           # Unit tests for Streamlit app
 ```
