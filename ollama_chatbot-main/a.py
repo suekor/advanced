@@ -5,6 +5,7 @@ import time
 from llama_index.llms.ollama import Ollama
 import chromadb
 from chromadb.config import Settings
+from sentence_transformers import SentenceTransformer
 
 logging.basicConfig(level=logging.INFO)
 
@@ -13,6 +14,8 @@ settings = Settings(
     allow_reset=True
 )
 client = chromadb.Client(settings)
+
+encoder = SentenceTransformer("all-MiniLM-L6-v2")
 
 def get_or_create_chroma_collection(name):
     try:
@@ -25,6 +28,8 @@ chat_collection = get_or_create_chroma_collection("chat_history")
 
 if 'messages' not in st.session_state:
     st.session_state.messages = []
+if 'file_contents' not in st.session_state:
+    st.session_state.file_contents = []
 
 def stream_chat(model, messages):
     try:
@@ -42,26 +47,37 @@ def stream_chat(model, messages):
         raise e
 
 def store_in_chroma(role, content):
+    vector = encoder.encode(content).tolist()
     chat_collection.add(
         documents=[content],
         metadatas=[{"role": role}],
         ids=[f"{role}-{len(st.session_state.messages)}"],
+        embeddings=[vector]
     )
 
-def retrieve_from_chroma():
+def retrieve_from_chroma(query, top_k=3):
     try:
-        results = chat_collection.get()
-        return results["documents"], results["metadatas"]
+        query_vector = encoder.encode(query).tolist()
+        results = chat_collection.query(query_embeddings=[query_vector], n_results=top_k)
+        return [doc for doc in results["documents"][0]]
     except Exception as e:
         logging.error(f"Ошибка при извлечении данных: {e}")
-        return [], []
+        return []
+
+def generate_multi_queries(query):
+    variations = [
+        f"Переформулируй: {query}",
+        f"Объясни другими словами: {query}",
+        f"Разъясни по-другому: {query}"
+    ]
+    return variations
 
 def load_constitution(file_path="constitution_kz.txt"):
     try:
         with open(file_path, "r", encoding="utf-8") as file:
             content = file.read()
         logging.info("Текст Конституции загружен успешно.")
-        st.session_state.messages.append({"role": "system", "content": content})
+        
         store_in_chroma("system", content)
     except FileNotFoundError:
         logging.error("Файл с Конституцией не найден. Убедитесь, что файл существует.")
@@ -70,23 +86,37 @@ def main():
     st.title("Chat with LLMs Models")
     logging.info("Приложение запущено")
 
-    load_constitution()
-
     model = st.sidebar.selectbox("Выберите модель", ["llama3.2:latest", "llama3.1 8b", "phi3", "mistral"])
     logging.info(f"Выбрана модель: {model}")
+    
+    load_constitution()
 
-    uploaded_file = st.sidebar.file_uploader("Загрузите текстовый файл", type="txt")
-    if uploaded_file is not None:
-        file_content = uploaded_file.read().decode("utf-8")
-        st.session_state.messages.append({"role": "system", "content": file_content})
-        store_in_chroma("system", file_content)
-        st.sidebar.success("Файл успешно загружен и добавлен в контекст.")
+    uploaded_files = st.sidebar.file_uploader("Загрузите текстовые файлы", type="txt", accept_multiple_files=True)
+    if uploaded_files:
+        for uploaded_file in uploaded_files:
+            file_content = uploaded_file.read().decode("utf-8")
+            st.session_state.file_contents.append(file_content)
+            store_in_chroma("system", file_content)
+        st.sidebar.success("Файлы успешно загружены и добавлены в контекст.")
 
     if prompt := st.chat_input("Ваш вопрос"):
         st.session_state.messages.append({"role": "user", "content": prompt})
         store_in_chroma("user", prompt)
         logging.info(f"Ввод пользователя: {prompt}")
 
+        queries = generate_multi_queries(prompt)
+        relevant_contexts = []
+        
+        # Добавляем релевантные данные из базы
+        for q in queries:
+            relevant_contexts.extend(retrieve_from_chroma(q))
+
+        # Добавляем содержимое загруженных файлов в контекст
+        relevant_contexts.extend(st.session_state.file_contents)
+
+        unique_contexts = list(set(relevant_contexts))[:5]
+        context_text = "\n".join(unique_contexts)
+        
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.write(message["content"])
@@ -99,6 +129,7 @@ def main():
                 with st.spinner("Ответ пишется..."):
                     try:
                         messages = [ChatMessage(role=msg["role"], content=msg["content"]) for msg in st.session_state.messages]
+                        messages.insert(0, ChatMessage(role="system", content=context_text))
                         response_message = stream_chat(model, messages)
                         duration = time.time() - start_time
                         response_message_with_duration = f"{response_message}\n\nДлительность: {duration:.2f} секунд"
@@ -106,17 +137,16 @@ def main():
                         store_in_chroma("assistant", response_message_with_duration)
                         st.write(f"Длительность: {duration:.2f} секунд")
                         logging.info(f"Ответ: {response_message}, Длительность: {duration:.2f} секунд")
-
                     except Exception as e:
                         st.session_state.messages.append({"role": "assistant", "content": str(e)})
                         st.error("Произошла ошибка при генерации ответа.")
                         logging.error(f"Ошибка: {str(e)}")
 
     if st.sidebar.button("Показать сохранённую историю"):
-        docs, metas = retrieve_from_chroma()
+        docs = retrieve_from_chroma("История запросов")
         st.sidebar.write("История сообщений:")
-        for doc, meta in zip(docs, metas):
-            st.sidebar.write(f"{meta['role']}: {doc}")
+        for doc in docs:
+            st.sidebar.write(doc)
 
 if __name__ == "__main__":
     main()
